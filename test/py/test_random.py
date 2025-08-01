@@ -4,6 +4,63 @@ from iden3math import random
 
 class TestBitVec1D(unittest.TestCase):
 
+    def test_evil_time_bucket_note_31(self):
+        gen: list[str] = []
+        for i in range(10000):
+            gen.append(random.get_bytes(31).hex())
+        gen_set: set[str] = set(gen)
+        if len(gen_set) != len(gen):
+            raise Exception("Evil repeated")
+
+    def test_evil_time_bucket_note_62(self):
+        gen: list[str] = []
+        for i in range(10000):
+            gen.append(random.get_bytes(62).hex())
+        gen_set: set[str] = set(gen)
+        if len(gen_set) != len(gen):
+            raise Exception("Evil repeated")
+
+    def test_not_evil(self):
+        random.get_bytes(31)
+        random.get_bytes(62)
+
+    def evil(self):  # Expect std::runtime_error("EVIL") to be thrown
+        count: int = 0
+        try:
+            random.get_bytes(31)
+        except:
+            count += 1
+        try:
+            random.get_bytes(62)
+        except:
+            count += 1
+        if count != 2:
+            raise Exception("Not evil")
+
+    def test_evil_commitment(self):
+        self.evil()
+
+    def test_evil_deposit(self):
+        self.evil()
+
+    def test_evil_withdraw(self):
+        self.evil()
+
+    def test_evil_secret(self):
+        self.evil()
+
+    def test_evil_nullifier(self):
+        self.evil()
+
+    def test_evil_note(self):
+        self.evil()
+
+    def test_evil_proof(self):
+        self.evil()
+
+    def test_evil_prove(self):
+        self.evil()
+
     def test_get_bytes_length(self):
         lengths = [1, 8, 16, 32, 64, 128, 256]
         for length in lengths:
