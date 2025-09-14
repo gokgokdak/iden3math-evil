@@ -130,3 +130,14 @@ if(BUILD_PY)
             LIBRARY DESTINATION "${CMAKE_SOURCE_DIR}/test/py"
     )
 endif()
+
+# Build tools
+if(BUILD_TOOLS)
+    # Precompute
+    include_directories(${CMAKE_SOURCE_DIR}/deps/SQLiteCpp/include)
+    include_directories(${CMAKE_SOURCE_DIR}/include)
+    add_subdirectory(${CMAKE_SOURCE_DIR}/deps/SQLiteCpp)
+    add_executable(precompute ${LIB_SOURCES_CXX} "${CMAKE_SOURCE_DIR}/tools/precompute.cxx")
+    target_compile_definitions(precompute PRIVATE IDEN3MATH_BUILD_TEST)
+    target_link_libraries(precompute SQLiteCpp ${GMP_LIBS})
+endif()
