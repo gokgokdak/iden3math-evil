@@ -1,43 +1,21 @@
+#include <SQLiteCpp/Database.h>
+#include <iden3math/bigint.h>
+#include <iden3math/ec/babyjub.h>
+#include <iden3math/fp1.h>
+#include <iden3math/hash/blake.h>
+#include <iden3math/hash/pedersen.h>
+#include <iden3math/prime.h>
+#include <iden3math/serialize.h>
 #include <chrono>
 #include <iostream>
-#include <sstream>
+#include <mutex>
 #include <thread>
-#include <SQLiteCpp/Database.h>
-#include "iden3math/bigint.h"
-#include "iden3math/ec/babyjub.h"
-#include "iden3math/fp1.h"
-#include "iden3math/hash/blake.h"
-#include "iden3math/hash/pedersen.h"
-#include "iden3math/prime.h"
-#include "iden3math/serialize.h"
 
 #define BUCKET_MS 100
 
 using namespace iden3math;
 
-bool job(int64_t start_unix_timestamp, int64_t end_unix_timestamp, bool* done, int64_t* progress) {
-    // Open database file
-    std::string db_file = "precomputed_" + std::to_string(start_unix_timestamp) + "_" + std::to_string(end_unix_timestamp) + ".sqlite";
-    std::shared_ptr<SQLite::Database> db;
-    try {
-        db = std::make_shared<SQLite::Database>(db_file, SQLite::OPEN_CREATE | SQLite::OPEN_READWRITE);
-        db->exec("PRAGMA journal_mode=WAL;"
-                 "CREATE TABLE IF NOT EXISTS t_precomputed (timestamp_ms INTEGER, commitment BLOB)");
-    } catch (const std::exception& e) {
-        std::cerr << "Failed to open " << db_file << ", " << e.what() << std::endl;
-        *done = true;
-        return false;
-    }
-
-    // Create database index
-    try {
-        SQLite::Statement create_index(*db, "CREATE INDEX IF NOT EXISTS idx_precomputed ON t_precomputed(timestamp_ms, commitment);");
-    } catch (const std::exception& e) {
-        std::cerr << "Failed to create database index, " << e.what() << std::endl;
-        *done = true;
-        return false;
-    }
-
+bool job(std::shared_ptr<SQLite::Database> db, std::mutex& mutex, int64_t start_unix_timestamp, int64_t end_unix_timestamp, bool* done, int64_t* progress) {
     // Generate and write database
     const auto fp1  = Fp1(prime::bn254());
     const auto salt = hash::blake256("iden3math");
@@ -66,10 +44,13 @@ bool job(int64_t start_unix_timestamp, int64_t end_unix_timestamp, bool* done, i
         auto commitment = point->x.bytes(BE);
         serialize::pad(commitment, 0x00, 32 - commitment.size(), false);
         // Insert
-        SQLite::Statement insert(*db, "INSERT INTO t_precomputed(timestamp_ms, commitment) VALUES (?, ?)");
-        insert.bind(1, seed);
-        insert.bind(2, commitment.data(), static_cast<int32_t>(commitment.size()));
-        insert.exec();
+        {
+            std::lock_guard lock(mutex);
+            SQLite::Statement insert(*db, "INSERT INTO t_precomputed(timestamp_ms, commitment) VALUES (?, ?)");
+            insert.bind(1, seed);
+            insert.bind(2, commitment.data(), static_cast<int32_t>(commitment.size()));
+            insert.exec();
+        }
         // Update progress
         ++*progress;
     }
@@ -120,6 +101,27 @@ int main(int argc, char* argv[]) {
               << ", notes=" << num_of_notes
               << std::endl;
 
+    // Open database file
+    std::string db_file = "precomputed_" + std::to_string(start_unix_timestamp) + "_" + std::to_string(end_unix_timestamp) + ".sqlite";
+    std::shared_ptr<SQLite::Database> db;
+    try {
+        db = std::make_shared<SQLite::Database>(db_file, SQLite::OPEN_CREATE | SQLite::OPEN_READWRITE);
+        db->exec("PRAGMA journal_mode=WAL;"
+                 "CREATE TABLE IF NOT EXISTS t_precomputed (timestamp_ms INTEGER, commitment BLOB)");
+    } catch (const std::exception& e) {
+        std::cerr << "Failed to open " << db_file << ", " << e.what() << std::endl;
+        return 1;
+    }
+    std::mutex db_mutex;
+
+    // Create database index
+    try {
+        SQLite::Statement create_index(*db, "CREATE INDEX IF NOT EXISTS idx_precomputed ON t_precomputed(timestamp_ms, commitment);");
+    } catch (const std::exception& e) {
+        std::cerr << "Failed to create database index, " << e.what() << std::endl;
+        return 1;
+    }
+
     // Start workers
     std::vector<std::shared_ptr<std::thread>> workers;
     bool* worker_done     = new bool[num_of_workers];
@@ -139,7 +141,9 @@ int main(int argc, char* argv[]) {
         worker_done[i] = false;
         worker_size[i] = (worker_end - worker_start) / BUCKET_MS + 1;
         worker_progress[i] = 0;
-        auto worker = std::make_shared<std::thread>(job, worker_start, worker_end, &worker_done[i], &worker_progress[i]);
+        auto worker = std::make_shared<std::thread>([&] {
+            job(db, db_mutex, worker_start, worker_end, &worker_done[i], &worker_progress[i]);
+        });
         worker->detach();
         workers.push_back(worker);
     }
