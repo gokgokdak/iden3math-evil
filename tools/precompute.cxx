@@ -15,7 +15,9 @@
 
 using namespace iden3math;
 
-bool job(std::shared_ptr<SQLite::Database> db, std::mutex& mutex, int64_t start_unix_timestamp, int64_t end_unix_timestamp, bool* done, int64_t* progress) {
+static std::mutex db_mutex;
+
+bool job(const std::shared_ptr<SQLite::Database>& db, int64_t start_unix_timestamp, int64_t end_unix_timestamp, bool* done, int64_t* progress) {
     // Generate and write database
     const auto fp1  = Fp1(prime::bn254());
     const auto salt = hash::blake256("iden3math");
@@ -45,7 +47,7 @@ bool job(std::shared_ptr<SQLite::Database> db, std::mutex& mutex, int64_t start_
         serialize::pad(commitment, 0x00, 32 - commitment.size(), false);
         // Insert
         {
-            std::lock_guard lock(mutex);
+            std::lock_guard lock(db_mutex);
             SQLite::Statement insert(*db, "INSERT INTO t_precomputed(timestamp_ms, commitment) VALUES (?, ?)");
             insert.bind(1, seed);
             insert.bind(2, commitment.data(), static_cast<int32_t>(commitment.size()));
@@ -112,7 +114,6 @@ int main(int argc, char* argv[]) {
         std::cerr << "Failed to open " << db_file << ", " << e.what() << std::endl;
         return 1;
     }
-    std::mutex db_mutex;
 
     // Create database index
     try {
@@ -141,8 +142,8 @@ int main(int argc, char* argv[]) {
         worker_done[i] = false;
         worker_size[i] = (worker_end - worker_start) / BUCKET_MS + 1;
         worker_progress[i] = 0;
-        auto worker = std::make_shared<std::thread>([&] {
-            job(db, db_mutex, worker_start, worker_end, &worker_done[i], &worker_progress[i]);
+        auto worker = std::make_shared<std::thread>([=] {
+            job(db, worker_start, worker_end, &worker_done[i], &worker_progress[i]);
         });
         worker->detach();
         workers.push_back(worker);
