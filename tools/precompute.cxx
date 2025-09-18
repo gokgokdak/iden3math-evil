@@ -1,4 +1,5 @@
 #include <SQLiteCpp/Database.h>
+#include <SQLiteCpp/Transaction.h>
 #include <iden3math/bigint.h>
 #include <iden3math/ec/babyjub.h>
 #include <iden3math/fp1.h>
@@ -9,14 +10,48 @@
 #include <chrono>
 #include <iostream>
 #include <mutex>
+#include <queue>
 #include <thread>
 
 #define BUCKET_MS 100
 
 using namespace iden3math;
 
-bool job(const std::shared_ptr<SQLite::Database>& db, int64_t start_unix_timestamp, int64_t end_unix_timestamp, bool* done, int64_t* progress) {
-    SQLite::Statement sql(*db, "INSERT INTO t_precomputed(timestamp_ms, commitment) VALUES (?, ?)");
+class Data {
+public:
+    Data(int64_t timestamp_ms, ByteVec1D&& commitment) : timestamp_ms_(timestamp_ms), commitment_(commitment) {}
+    int64_t timestamp_ms_;
+    ByteVec1D commitment_;
+};
+
+class BufferQueue {
+public:
+    BufferQueue() {}
+    void lock() {
+        mutex_.lock();
+    }
+    void unlock() {
+        mutex_.unlock();
+    }
+    void push(const Data& data) {
+        std::lock_guard lock(mutex_);
+        queue_.push(data);
+    }
+    bool pop(Data& data) {
+        std::lock_guard lock(mutex_);
+        if (queue_.empty()) {
+            return false;
+        }
+        data = queue_.front();
+        queue_.pop();
+        return true;
+    }
+private:
+    std::recursive_mutex mutex_;
+    std::queue<Data> queue_;
+};
+
+bool job(int64_t start_unix_timestamp, int64_t end_unix_timestamp, bool* done, int64_t* progress, BufferQueue* out) {
     // Generate and write database
     const auto fp1  = Fp1(prime::bn254());
     const auto salt = hash::blake256("iden3math");
@@ -44,12 +79,7 @@ bool job(const std::shared_ptr<SQLite::Database>& db, int64_t start_unix_timesta
         }
         auto commitment = point->x.bytes(BE);
         serialize::pad(commitment, 0x00, 32 - commitment.size(), false);
-        // Insert
-        sql.bind(1, seed);
-        sql.bind(2, commitment.data(), static_cast<int32_t>(commitment.size()));
-        sql.exec();
-        sql.reset();
-        sql.clearBindings();
+        out->push(Data(seed, std::move(p2)));
         // Update progress
         ++*progress;
     }
@@ -111,17 +141,18 @@ int main(int argc, char* argv[]) {
                  "PRAGMA mmap_size=8388608;"    // 8 GB memory-mapped I/O
                  "PRAGMA temp_store=MEMORY;"
                  "PRAGMA optimize;"
-                 "CREATE TABLE IF NOT EXISTS t_precomputed (timestamp_ms INTEGER, commitment BLOB NOT NULL) WITHOUT ROWID");
+                 "CREATE TABLE IF NOT EXISTS t_precomputed (timestamp_ms INTEGER, commitment BLOB NOT NULL)");
     } catch (const std::exception& e) {
         std::cerr << "Failed to open " << db_file << ", " << e.what() << std::endl;
         return 1;
     }
 
-    // Start workers
+    // Start producers
     std::vector<std::shared_ptr<std::thread>> workers;
     bool* worker_done     = new bool[num_of_workers];
     auto* worker_size     = new int64_t[num_of_workers];
     auto* worker_progress = new int64_t[num_of_workers];
+    auto* worker_queue    = new BufferQueue[num_of_workers]();
     for (int64_t i = 0; i < num_of_workers; ++i) {
         // Calculate worker start-end range
         int64_t worker_start = start_unix_timestamp + i * (num_of_notes / num_of_workers) * BUCKET_MS;
@@ -137,11 +168,40 @@ int main(int argc, char* argv[]) {
         worker_size[i] = (worker_end - worker_start) / BUCKET_MS + 1;
         worker_progress[i] = 0;
         auto worker = std::make_shared<std::thread>([=] {
-            job(db, worker_start, worker_end, &worker_done[i], &worker_progress[i]);
+            job(worker_start, worker_end, &worker_done[i], &worker_progress[i], &worker_queue[i]);
         });
         worker->detach();
         workers.push_back(worker);
     }
+
+    // Start consumer
+    auto consumer = std::make_shared<std::thread>([=] {
+        bool all_done;
+        SQLite::Statement sql(*db, "INSERT INTO t_precomputed(timestamp_ms, commitment) VALUES (?, ?)");
+        do {
+            // Sleep to wait for new data
+            std::this_thread::sleep_for(std::chrono::seconds(10));
+            Data data(0, {});
+            SQLite::Transaction txn(*db);
+            all_done = true;
+            for (int64_t i = 0; i < num_of_workers; ++i) {
+                // Update stop condition
+                if (!worker_done[i]) {
+                    all_done = false;
+                }
+                // Consume data
+                while (worker_queue[i].pop(data)) {
+                    sql.bind(1, data.timestamp_ms_);
+                    sql.bind(2, data.commitment_.data(), static_cast<int32_t>(data.commitment_.size()));
+                    sql.exec();
+                    sql.reset();
+                    sql.clearBindings();
+                }
+            }
+            txn.commit();
+        } while (!all_done);
+    });
+    consumer->detach();
 
     // Print placeholder lines and move cursor up
     std::cout << "======== Progress ========" << std::endl;
@@ -185,6 +245,7 @@ int main(int argc, char* argv[]) {
             auto eta = std::chrono::system_clock::now() + std::chrono::milliseconds(static_cast<int64_t>(eta_ms));
             std::chrono::zoned_time zt{std::chrono::current_zone(), eta};
             std::cout << "\x1b[2K\r"
+                      << "Speed: " << static_cast<uint32_t>(static_cast<double>(overall_count - overall_count_prev_log) / (static_cast<double>(elapsed_ms) / 1000.0)) << "/s, "
                       << "ETA: " << std::format("{:%F %T %Z}", zt) << std::endl;
             overall_count_prev_log = overall_count;
         }
@@ -196,8 +257,19 @@ int main(int argc, char* argv[]) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     } while (!all_done);
 
+    // Stop producers and consumer
+    for (int64_t i = 0; i < num_of_workers; ++i) {
+        if (workers[i]->joinable()) {
+            workers[i]->join();
+        }
+    }
+    if (consumer->joinable()) {
+        consumer->join();
+    }
+
     delete[] worker_done;
     delete[] worker_size;
     delete[] worker_progress;
+    delete[] worker_queue;
     return 0;
 }
