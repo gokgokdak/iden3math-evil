@@ -46,6 +46,10 @@ public:
         queue_.pop();
         return true;
     }
+    bool empty() {
+        std::lock_guard lock(mutex_);
+        return queue_.empty();
+    }
 private:
     std::recursive_mutex mutex_;
     std::queue<Data> queue_;
@@ -175,7 +179,7 @@ int main(int argc, char* argv[]) {
     }
 
     // Start consumer
-    auto consumer = std::make_shared<std::thread>([=] {
+    auto consumer = std::make_shared<std::thread>([&] {
         bool all_done;
         SQLite::Statement sql(*db, "INSERT INTO t_precomputed(timestamp_ms, commitment) VALUES (?, ?)");
         do {
@@ -186,10 +190,11 @@ int main(int argc, char* argv[]) {
             all_done = true;
             for (int64_t i = 0; i < num_of_workers; ++i) {
                 // Update stop condition
-                if (!worker_done[i]) {
+                if (!worker_done[i] || !worker_queue[i].empty()) {
                     all_done = false;
                 }
                 // Consume data
+                worker_queue[i].lock();
                 while (worker_queue[i].pop(data)) {
                     sql.bind(1, data.timestamp_ms_);
                     sql.bind(2, data.commitment_.data(), static_cast<int32_t>(data.commitment_.size()));
@@ -197,6 +202,7 @@ int main(int argc, char* argv[]) {
                     sql.reset();
                     sql.clearBindings();
                 }
+                worker_queue[i].unlock();
             }
             txn.commit();
         } while (!all_done);
@@ -228,7 +234,7 @@ int main(int argc, char* argv[]) {
         all_done = true;
         // Check worker status and print progress
         for (int64_t i = 0; i < num_of_workers; ++i) {
-            if (!worker_done[i]) {
+            if (!worker_done[i] || !worker_queue[i].empty()) {
                 all_done = false;
             }
             overall_count += worker_progress[i];
