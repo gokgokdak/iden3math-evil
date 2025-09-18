@@ -47,6 +47,7 @@ public:
         return true;
     }
     bool empty() {
+        std::lock_guard lock(mutex_);
         return queue_.empty();
     }
 private:
