@@ -83,7 +83,7 @@ bool job(int64_t start_unix_timestamp, int64_t end_unix_timestamp, bool* done, i
         }
         auto commitment = point->x.bytes(BE);
         serialize::pad(commitment, 0x00, 32 - commitment.size(), false);
-        out->push(Data(seed, std::move(p2)));
+        out->push(Data(seed, std::move(commitment)));
         // Update progress
         ++*progress;
     }
